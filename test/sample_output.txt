@@ -1,0 +1,61 @@
+order2cash-demo: pkg_order_mgmt test run
+============================================================
+
+══════════════════════════════════════════════
+  TEST 1: Happy path (create -> validate -> fulfill)
+══════════════════════════════════════════════
+--- Step 1: validate_stock ---
+[validate_stock] Product "Wireless Mouse" OK — stock: 200, requested: 2
+[validate_stock] Product "Mechanical Keyboard" OK — stock: 80, requested: 1
+[validate_stock] Product "USB-C Hub 7-port" OK — stock: 120, requested: 1
+[validate_stock] All 3 line(s) validated. Estimated value: $269.96
+validate_stock returned total value: $269.96
+--- Step 2: create_order ---
+[create_order] Order #4 created with 3 line(s). Total: $269.96
+create_order returned order_id: 4
+DB status after create: PENDING
+Manually set status -> VALIDATED
+--- Step 3: fulfill_order ---
+[fulfill_order] Order #4 fulfilled. 3 product(s) decremented.
+DB status after fulfill: FULFILLED
+Stock after fulfill:
+  Wireless Mouse      -> 198 (was 200, decremented by 2)
+  Mechanical Keyboard -> 79 (was 80,  decremented by 1)
+  USB-C Hub           -> 119 (was 120, decremented by 1)
+TEST 1 PASSED
+
+══════════════════════════════════════════════
+  TEST 2: Insufficient stock -> e_insufficient_stock
+══════════════════════════════════════════════
+Attempting validate_stock with qty=999 for Ergonomic Chair (stock=20)...
+Caught e_insufficient_stock as expected.
+Exception message: ORA-20001: Insufficient stock for product "Ergonomic Chair" (id=10): requested 999, available 20.
+TEST 2 PASSED
+
+══════════════════════════════════════════════
+  TEST 3: fulfill_order on PENDING order -> e_invalid_order_status
+══════════════════════════════════════════════
+[create_order] Order #5 created with 1 line(s). Total: $39.99
+Created order #5 (status=PENDING)
+Caught e_invalid_order_status as expected.
+Exception message: ORA-20002: Cannot fulfill order #5: expected status VALIDATED, found PENDING.
+TEST 3 PASSED
+
+══════════════════════════════════════════════
+  TEST 4: fulfill_order(99999) -> e_order_not_found
+══════════════════════════════════════════════
+Caught e_order_not_found as expected.
+Exception message: ORA-20003: Order 99999 does not exist.
+TEST 4 PASSED
+
+══════════════════════════════════════════════
+  TEST 5: validate_stock(product_id=88888) -> e_product_not_found
+══════════════════════════════════════════════
+Caught e_product_not_found as expected.
+SQLCODE : -20004
+Exception message: ORA-20004: Product 88888 not found.
+TEST 5 PASSED
+
+══════════════════════════════════════════════
+  ALL TESTS COMPLETE
+══════════════════════════════════════════════
