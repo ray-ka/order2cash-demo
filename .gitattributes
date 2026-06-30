@@ -1,0 +1,2 @@
+sql/*.sql   linguist-detectable=true
+test/*.sql  linguist-detectable=true
