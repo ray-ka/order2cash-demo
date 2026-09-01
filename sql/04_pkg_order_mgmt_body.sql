@@ -2,6 +2,13 @@
 -- 04_pkg_order_mgmt_body.sql
 -- Package body for pkg_order_mgmt.
 -- Run as ORDER2CASH user after the spec.
+--
+-- TRANSACTION CONTROL: no procedure in this package issues COMMIT or
+-- ROLLBACK. Both are the caller's responsibility. Embedding COMMIT here
+-- would silently commit whatever else the caller had pending in the same
+-- transaction; embedding ROLLBACK here would silently undo it. A reusable
+-- package has no way to know what else is in the caller's transaction, so
+-- it must not make that call.
 -- =============================================================================
 
 CREATE OR REPLACE PACKAGE BODY pkg_order_mgmt AS
@@ -12,7 +19,7 @@ CREATE OR REPLACE PACKAGE BODY pkg_order_mgmt AS
 
     -- Fetches the current status of an order; raises e_order_not_found if
     -- the row doesn't exist.  Centralising this avoids duplicating the
-    -- SELECT + exception logic across fulfill_order and any future procedures.
+    -- SELECT + exception logic across every procedure that checks status.
     FUNCTION get_order_status (p_order_id IN NUMBER) RETURN VARCHAR2 IS
         v_status orders.status%TYPE;
     BEGIN
@@ -72,9 +79,6 @@ CREATE OR REPLACE PACKAGE BODY pkg_order_mgmt AS
         RETURNING order_id INTO o_order_id;
 
         -- ── Step 3: bulk-insert all line items ───────────────────────────────
-        -- FORALL submits the entire collection as a single SQL statement.
-        -- The SQL%BULK_ROWCOUNT pseudo-collection could be inspected post-hoc
-        -- for audit, but we omit that here for brevity.
         FORALL i IN 1 .. p_lines.COUNT
             INSERT INTO order_lines (order_id, product_id, quantity, unit_price)
             SELECT o_order_id,
@@ -84,8 +88,6 @@ CREATE OR REPLACE PACKAGE BODY pkg_order_mgmt AS
               FROM products
              WHERE product_id = p_lines(i).product_id;
 
-        COMMIT;
-
         DBMS_OUTPUT.PUT_LINE('[create_order] Order #' || o_order_id ||
             ' created with ' || p_lines.COUNT || ' line(s). Total: ' ||
             TO_CHAR(v_total, 'FM$999,990.00'));
@@ -93,15 +95,13 @@ CREATE OR REPLACE PACKAGE BODY pkg_order_mgmt AS
     EXCEPTION
         -- Propagate our named exceptions unchanged so callers can branch on
         -- exactly what went wrong rather than receiving a generic OTHERS wrap.
-        -- e_invalid_order_status: raised by the empty-lines guard above.
-        -- e_product_not_found:    raised by the product price-lookup loop above.
         WHEN e_invalid_order_status OR e_product_not_found THEN
-            ROLLBACK;
             RAISE;
         WHEN OTHERS THEN
-            -- Re-raise as a descriptive error; never swallow silently.
-            ROLLBACK;
-            RAISE_APPLICATION_ERROR(-20002,
+            -- Distinct code (-20099) from any business exception above, so a
+            -- caller catching e.g. e_invalid_order_status by name can never
+            -- accidentally catch an unrelated failure here instead.
+            RAISE_APPLICATION_ERROR(-20099,
                 'create_order failed: ' || SQLERRM);
     END create_order;
 
@@ -109,68 +109,59 @@ CREATE OR REPLACE PACKAGE BODY pkg_order_mgmt AS
     -- =========================================================================
     -- validate_stock
     -- =========================================================================
-    -- DESIGN: We use a parameterised explicit cursor (opened once per line item)
-    -- rather than implicit SELECT INTO because:
-    --   a) %ROWTYPE binds the loop variable to the cursor's column projection,
-    --      so adding a column to the SELECT is a single-site change and the
-    --      loop variable automatically reflects it — no variable rename churn.
-    --   b) Explicit cursor state (%NOTFOUND, %ISOPEN) makes the product-not-found
-    --      check declarative rather than relying on a NO_DATA_FOUND exception
-    --      inside every iteration's inner BEGIN/EXCEPTION/END block.
-    --   c) The named cursor declaration separates query definition from loop
-    --      logic, which aids readability when the SELECT is non-trivial.
-    -- NOTE: The cursor IS opened once per element in p_lines (N opens total).
-    -- That is intentional here: we need per-item error messages with the
-    -- product name and exact quantities, which a single bulk query would make
-    -- harder to produce cleanly without a secondary lookup on failure.
+    -- DESIGN: p_lines joins directly against PRODUCTS via TABLE() in a single
+    -- set-based query. This replaced an earlier version that opened one
+    -- parameterised cursor per line item (N round trips to the SQL engine).
+    -- TABLE() only works because t_line_item_tbl is a SQL-level object type
+    -- (see 01_schema.sql) rather than a PL/SQL-only record/collection.
     PROCEDURE validate_stock (
         p_lines         IN  t_line_item_tbl,
         o_total_value   OUT NUMBER
     ) IS
-        v_total     NUMBER := 0;
+        v_total  NUMBER := 0;
 
-        -- Parameterised explicit cursor: fetches stock and price for one product
-        -- at a time, passing requested_qty as a bind parameter so the loop body
-        -- receives a complete %ROWTYPE without a separate variable for qty.
-        CURSOR c_stock (p_product_id IN NUMBER, p_qty IN NUMBER) IS
-            SELECT p.product_id,
-                   p.name,
-                   p.stock_qty,
-                   p.unit_price,
-                   p_qty AS requested_qty
-              FROM products p
-             WHERE p.product_id = p_product_id;
-
-        v_row c_stock%ROWTYPE;
+        TYPE t_check_row IS RECORD (
+            product_id     products.product_id%TYPE,
+            name           products.name%TYPE,
+            stock_qty      products.stock_qty%TYPE,
+            unit_price     products.unit_price%TYPE,
+            requested_qty  NUMBER
+        );
+        TYPE t_check_tbl IS TABLE OF t_check_row;
+        v_rows t_check_tbl;
     BEGIN
         o_total_value := 0;
 
-        FOR i IN 1 .. p_lines.COUNT LOOP
-            OPEN c_stock(p_lines(i).product_id, p_lines(i).quantity);
-            FETCH c_stock INTO v_row;
+        IF p_lines IS NULL OR p_lines.COUNT = 0 THEN
+            RAISE_APPLICATION_ERROR(-20002, 'Order must contain at least one line item.');
+        END IF;
 
-            IF c_stock%NOTFOUND THEN
-                CLOSE c_stock;
-                RAISE_APPLICATION_ERROR(-20004,
-                    'Product ' || p_lines(i).product_id || ' not found.');
-            END IF;
+        -- One statement, one round trip — regardless of how many lines p_lines
+        -- holds. Assumes at most one line per product_id (matches how every
+        -- caller in this repo builds its line collection).
+        SELECT p.product_id, p.name, p.stock_qty, p.unit_price, l.quantity
+          BULK COLLECT INTO v_rows
+          FROM products p
+          JOIN TABLE(p_lines) l ON l.product_id = p.product_id;
 
-            CLOSE c_stock;
+        IF v_rows.COUNT < p_lines.COUNT THEN
+            RAISE_APPLICATION_ERROR(-20004,
+                'One or more requested products do not exist.');
+        END IF;
 
-            -- Core stock check — raise named exception so callers can
-            -- distinguish "not enough stock" from generic errors.
-            IF v_row.stock_qty < v_row.requested_qty THEN
+        FOR i IN 1 .. v_rows.COUNT LOOP
+            IF v_rows(i).stock_qty < v_rows(i).requested_qty THEN
                 RAISE_APPLICATION_ERROR(-20001,
-                    'Insufficient stock for product "' || v_row.name ||
-                    '" (id=' || v_row.product_id || '): requested ' ||
-                    v_row.requested_qty || ', available ' || v_row.stock_qty || '.');
+                    'Insufficient stock for product "' || v_rows(i).name ||
+                    '" (id=' || v_rows(i).product_id || '): requested ' ||
+                    v_rows(i).requested_qty || ', available ' || v_rows(i).stock_qty || '.');
             END IF;
 
-            v_total := v_total + (v_row.unit_price * v_row.requested_qty);
+            v_total := v_total + (v_rows(i).unit_price * v_rows(i).requested_qty);
 
-            DBMS_OUTPUT.PUT_LINE('[validate_stock] Product "' || v_row.name ||
-                '" OK — stock: ' || v_row.stock_qty ||
-                ', requested: ' || v_row.requested_qty);
+            DBMS_OUTPUT.PUT_LINE('[validate_stock] Product "' || v_rows(i).name ||
+                '" OK — stock: ' || v_rows(i).stock_qty ||
+                ', requested: ' || v_rows(i).requested_qty);
         END LOOP;
 
         o_total_value := v_total;
@@ -179,30 +170,99 @@ CREATE OR REPLACE PACKAGE BODY pkg_order_mgmt AS
             TO_CHAR(v_total, 'FM$999,990.00'));
 
     EXCEPTION
-        -- Propagate named exceptions unchanged; both carry a descriptive message.
-        WHEN e_insufficient_stock OR e_product_not_found THEN
+        WHEN e_insufficient_stock OR e_product_not_found OR e_invalid_order_status THEN
             RAISE;
         WHEN OTHERS THEN
-            RAISE_APPLICATION_ERROR(-20002,
+            RAISE_APPLICATION_ERROR(-20099,
                 'validate_stock failed: ' || SQLERRM);
     END validate_stock;
 
 
     -- =========================================================================
+    -- validate_order
+    -- =========================================================================
+    -- DESIGN: This is the procedure that actually performs the PENDING ->
+    -- VALIDATED transition. Previously nothing in this package set VALIDATED
+    -- at all — only a test script's raw UPDATE did, which meant the status
+    -- machine had no real gatekeeper for that step.
+    PROCEDURE validate_order (
+        p_order_id IN NUMBER
+    ) IS
+        v_status  orders.status%TYPE;
+
+        CURSOR c_check IS
+            SELECT p.product_id, p.name, p.stock_qty, ol.quantity
+              FROM order_lines ol
+              JOIN products p ON p.product_id = ol.product_id
+             WHERE ol.order_id = p_order_id;
+        TYPE t_check_tbl IS TABLE OF c_check%ROWTYPE;
+        v_rows t_check_tbl;
+    BEGIN
+        v_status := get_order_status(p_order_id);   -- raises e_order_not_found
+
+        IF v_status != 'PENDING' THEN
+            RAISE_APPLICATION_ERROR(-20002,
+                'Cannot validate order #' || p_order_id ||
+                ': expected status PENDING, found ' || v_status || '.');
+        END IF;
+
+        OPEN c_check;
+        FETCH c_check BULK COLLECT INTO v_rows;
+        CLOSE c_check;
+
+        IF v_rows.COUNT = 0 THEN
+            RAISE_APPLICATION_ERROR(-20002,
+                'Order #' || p_order_id || ' has no line items.');
+        END IF;
+
+        FOR i IN 1 .. v_rows.COUNT LOOP
+            IF v_rows(i).stock_qty < v_rows(i).quantity THEN
+                RAISE_APPLICATION_ERROR(-20001,
+                    'Insufficient stock for product "' || v_rows(i).name ||
+                    '" (id=' || v_rows(i).product_id || '): requested ' ||
+                    v_rows(i).quantity || ', available ' || v_rows(i).stock_qty || '.');
+            END IF;
+        END LOOP;
+
+        UPDATE orders SET status = 'VALIDATED' WHERE order_id = p_order_id;
+
+        DBMS_OUTPUT.PUT_LINE('[validate_order] Order #' || p_order_id ||
+            ' -> VALIDATED (' || v_rows.COUNT || ' line(s) checked).');
+
+    EXCEPTION
+        WHEN e_order_not_found OR e_invalid_order_status OR e_insufficient_stock THEN
+            RAISE;
+        WHEN OTHERS THEN
+            RAISE_APPLICATION_ERROR(-20099,
+                'validate_order failed for order #' || p_order_id || ': ' || SQLERRM);
+    END validate_order;
+
+
+    -- =========================================================================
     -- fulfill_order
     -- =========================================================================
-    -- DESIGN: Stock decrements use BULK COLLECT + FORALL rather than a cursor
-    -- loop to avoid N individual UPDATE statements.  We first collect all
-    -- (product_id, quantity) pairs from order_lines, then fire a single bulk
-    -- UPDATE.  This keeps the SQL engine's undo/redo generation concentrated
-    -- in one statement, which is more efficient for larger orders.
+    -- DESIGN: Stock decrements use BULK COLLECT + FORALL to avoid N individual
+    -- UPDATE statements. Before decrementing, the affected product rows are
+    -- locked with SELECT ... FOR UPDATE and stock is re-verified under that
+    -- lock. validate_order may have run long before this call, and another
+    -- order could have consumed the same stock in the meantime — locking and
+    -- re-checking here closes that gap, rather than leaving it to the
+    -- stock_qty >= 0 CHECK constraint to fail the statement after the fact.
     PROCEDURE fulfill_order (p_order_id IN NUMBER) IS
         v_status  orders.status%TYPE;
 
-        -- BULK COLLECT targets
-        TYPE t_num_tbl IS TABLE OF NUMBER;
-        v_product_ids  t_num_tbl;
-        v_quantities   t_num_tbl;
+        -- SYS.ODCINUMBERLIST is a built-in SQL nested table of NUMBER — using
+        -- it here means we don't need a custom type just to pass a list of
+        -- ids into TABLE() below.
+        v_product_ids   SYS.ODCINUMBERLIST;
+        v_quantities    SYS.ODCINUMBERLIST;
+        v_locked_ids    SYS.ODCINUMBERLIST;
+        v_locked_stock  SYS.ODCINUMBERLIST;
+
+        -- Locked stock snapshot keyed by product_id, for O(1) lookup against
+        -- v_product_ids/v_quantities.
+        TYPE t_stock_map IS TABLE OF NUMBER INDEX BY VARCHAR2(40);
+        v_stock_map t_stock_map;
 
     BEGIN
         -- ── Guard: order must exist and be VALIDATED ──────────────────────────
@@ -215,47 +275,88 @@ CREATE OR REPLACE PACKAGE BODY pkg_order_mgmt AS
         END IF;
 
         -- ── Step 1: bulk-collect all line items for this order ────────────────
-        -- BULK COLLECT fetches all rows in one round-trip, populating the
-        -- two parallel collections we'll use in the FORALL below.
         SELECT product_id, quantity
           BULK COLLECT INTO v_product_ids, v_quantities
           FROM order_lines
          WHERE order_id = p_order_id;
 
         IF v_product_ids.COUNT = 0 THEN
-            RAISE_APPLICATION_ERROR(-20003,
+            RAISE_APPLICATION_ERROR(-20002,
                 'Order #' || p_order_id || ' has no line items.');
         END IF;
 
-        -- ── Step 2: bulk-decrement stock ──────────────────────────────────────
-        -- FORALL sends all UPDATEs as one batched statement.
-        -- The CHECK constraint on products.stock_qty (>= 0) acts as a
-        -- last-resort guard; validate_stock should be called before this.
+        -- ── Step 2: lock the affected product rows and re-verify stock ────────
+        SELECT product_id, stock_qty
+          BULK COLLECT INTO v_locked_ids, v_locked_stock
+          FROM products
+         WHERE product_id IN (SELECT column_value FROM TABLE(v_product_ids))
+           FOR UPDATE;
+
+        FOR i IN 1 .. v_locked_ids.COUNT LOOP
+            v_stock_map(TO_CHAR(v_locked_ids(i))) := v_locked_stock(i);
+        END LOOP;
+
+        FOR i IN 1 .. v_product_ids.COUNT LOOP
+            IF v_stock_map(TO_CHAR(v_product_ids(i))) < v_quantities(i) THEN
+                RAISE_APPLICATION_ERROR(-20001,
+                    'Insufficient stock for product id=' || v_product_ids(i) ||
+                    ' at fulfillment time: requested ' || v_quantities(i) ||
+                    ', available ' || v_stock_map(TO_CHAR(v_product_ids(i))) || '.');
+            END IF;
+        END LOOP;
+
+        -- ── Step 3: bulk-decrement stock (rows already locked above) ──────────
         FORALL i IN 1 .. v_product_ids.COUNT
             UPDATE products
                SET stock_qty = stock_qty - v_quantities(i)
              WHERE product_id = v_product_ids(i);
 
-        -- ── Step 3: mark order FULFILLED ────────────────────────────────────
+        -- ── Step 4: mark order FULFILLED ────────────────────────────────────
         UPDATE orders
            SET status = 'FULFILLED'
          WHERE order_id = p_order_id;
-
-        COMMIT;
 
         DBMS_OUTPUT.PUT_LINE('[fulfill_order] Order #' || p_order_id ||
             ' fulfilled. ' || v_product_ids.COUNT || ' product(s) decremented.');
 
     EXCEPTION
-        WHEN e_order_not_found OR e_invalid_order_status THEN
-            ROLLBACK;
+        WHEN e_order_not_found OR e_invalid_order_status OR e_insufficient_stock THEN
             RAISE;
         WHEN OTHERS THEN
-            -- Could be a CHECK constraint violation (stock went negative)
-            ROLLBACK;
-            RAISE_APPLICATION_ERROR(-20001,
+            RAISE_APPLICATION_ERROR(-20099,
                 'fulfill_order failed for order #' || p_order_id || ': ' || SQLERRM);
     END fulfill_order;
+
+
+    -- =========================================================================
+    -- cancel_order
+    -- =========================================================================
+    -- DESIGN: The only path to CANCELLED. Valid starting states are PENDING
+    -- and VALIDATED; a FULFILLED or already-CANCELLED order cannot be
+    -- cancelled. Previously CANCELLED was unreachable from any code path at
+    -- all — this closes that gap.
+    PROCEDURE cancel_order (p_order_id IN NUMBER) IS
+        v_status orders.status%TYPE;
+    BEGIN
+        v_status := get_order_status(p_order_id);   -- raises e_order_not_found
+
+        IF v_status NOT IN ('PENDING', 'VALIDATED') THEN
+            RAISE_APPLICATION_ERROR(-20002,
+                'Cannot cancel order #' || p_order_id ||
+                ': orders in status ' || v_status || ' cannot be cancelled.');
+        END IF;
+
+        UPDATE orders SET status = 'CANCELLED' WHERE order_id = p_order_id;
+
+        DBMS_OUTPUT.PUT_LINE('[cancel_order] Order #' || p_order_id || ' -> CANCELLED.');
+
+    EXCEPTION
+        WHEN e_order_not_found OR e_invalid_order_status THEN
+            RAISE;
+        WHEN OTHERS THEN
+            RAISE_APPLICATION_ERROR(-20099,
+                'cancel_order failed for order #' || p_order_id || ': ' || SQLERRM);
+    END cancel_order;
 
 END pkg_order_mgmt;
 /

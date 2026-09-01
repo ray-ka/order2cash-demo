@@ -2,7 +2,7 @@ order2cash-demo: pkg_order_mgmt test run
 ============================================================
 
 ══════════════════════════════════════════════
-  TEST 1: Happy path (create -> validate -> fulfill)
+  TEST 1: Happy path (create -> validate_order -> fulfill_order)
 ══════════════════════════════════════════════
 --- Step 1: validate_stock ---
 [validate_stock] Product "Wireless Mouse" OK — stock: 200, requested: 2
@@ -14,8 +14,10 @@ validate_stock returned total value: $269.96
 [create_order] Order #4 created with 3 line(s). Total: $269.96
 create_order returned order_id: 4
 DB status after create: PENDING
-Manually set status -> VALIDATED
---- Step 3: fulfill_order ---
+--- Step 3: validate_order ---
+[validate_order] Order #4 -> VALIDATED (3 line(s) checked).
+DB status after validate_order: VALIDATED
+--- Step 4: fulfill_order ---
 [fulfill_order] Order #4 fulfilled. 3 product(s) decremented.
 DB status after fulfill: FULFILLED
 Stock after fulfill:
@@ -53,8 +55,33 @@ TEST 4 PASSED
 ══════════════════════════════════════════════
 Caught e_product_not_found as expected.
 SQLCODE : -20004
-Exception message: ORA-20004: Product 88888 not found.
+Exception message: ORA-20004: One or more requested products do not exist.
 TEST 5 PASSED
+
+══════════════════════════════════════════════
+  TEST 6: validate_order(99999) -> e_order_not_found
+══════════════════════════════════════════════
+Caught e_order_not_found as expected.
+Exception message: ORA-20003: Order 99999 does not exist.
+TEST 6 PASSED
+
+══════════════════════════════════════════════
+  TEST 7: cancel_order (PENDING -> CANCELLED), then fulfill rejected
+══════════════════════════════════════════════
+[create_order] Order #6 created with 1 line(s). Total: $89.99
+Created order #6 (status=PENDING)
+[cancel_order] Order #6 -> CANCELLED.
+DB status after cancel_order: CANCELLED
+Caught e_invalid_order_status as expected.
+Exception message: ORA-20002: Cannot fulfill order #6: expected status VALIDATED, found CANCELLED.
+TEST 7 PASSED
+
+══════════════════════════════════════════════
+  TEST 8: cancel_order on a FULFILLED order -> e_invalid_order_status
+══════════════════════════════════════════════
+Caught e_invalid_order_status as expected.
+Exception message: ORA-20002: Cannot cancel order #4: orders in status FULFILLED cannot be cancelled.
+TEST 8 PASSED
 
 ══════════════════════════════════════════════
   ALL TESTS COMPLETE

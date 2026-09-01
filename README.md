@@ -40,8 +40,10 @@ All primary keys use `GENERATED ALWAYS AS IDENTITY` (Oracle 12c+). Foreign keys 
 
 | Type | Kind | Purpose |
 |---|---|---|
-| `t_line_item` | RECORD | One line submitted by the caller: `product_id`, `quantity` |
-| `t_line_item_tbl` | TABLE OF t_line_item | Unbounded collection of line items |
+| `t_line_item_obj` | SQL OBJECT (schema-level) | One line: `product_id`, `quantity` |
+| `t_line_item_tbl` | SQL TABLE OF t_line_item_obj (schema-level) | Unbounded collection of line items |
+
+Both are created in `01_schema.sql`, not inside the package spec. A PL/SQL-only record/collection can't be unnested with `TABLE()`; a SQL object type can. That's what lets `validate_stock` join a caller's collection against `PRODUCTS` in one set-based query instead of looping row by row.
 
 ### Custom exceptions (spec)
 
@@ -51,19 +53,28 @@ All primary keys use `GENERATED ALWAYS AS IDENTITY` (Oracle 12c+). Foreign keys 
 | `e_invalid_order_status` | -20002 | An order-state transition is not permitted (e.g. fulfilling a PENDING order, submitting zero lines) |
 | `e_order_not_found` | -20003 | The order_id does not exist |
 | `e_product_not_found` | -20004 | A product_id in the line items does not exist |
+| `e_unexpected_error` | -20099 | Anything not covered by the four above (a `WHEN OTHERS` catch-all) |
 
-Declared in the spec (not the body) so any calling block can catch them by name without referencing internal package state.
+Declared in the spec (not the body) so any calling block can catch them by name without referencing internal package state. `e_unexpected_error` deliberately has its own code, separate from the four business exceptions — a generic `WHEN OTHERS` handler must never reuse a named business exception's code, or a caller catching that exception by name ends up silently catching unrelated failures too.
 
 ### Procedures
 
+The order lifecycle is `PENDING -> VALIDATED -> FULFILLED` or `PENDING/VALIDATED -> CANCELLED`. Each transition is owned by exactly one procedure below; none of them commit — the caller controls the transaction boundary.
+
 **`create_order(p_customer_id, p_lines, o_order_id OUT)`**  
-Inserts the order header and all line items. Returns the generated `order_id`.
+Inserts the order header (status `PENDING`) and all line items. Returns the generated `order_id`.
 
 **`validate_stock(p_lines, o_total_value OUT)`**  
-Checks stock availability for every requested line. Raises `e_insufficient_stock` on first failure with a descriptive message (product name, requested qty, available qty).
+Stateless feasibility check against `PRODUCTS` directly — no order needs to exist yet. Raises `e_insufficient_stock` with a descriptive message (product name, requested qty, available qty).
+
+**`validate_order(p_order_id)`**  
+Re-checks stock for an existing order's line items and, if sufficient, transitions it `PENDING -> VALIDATED`. This is the procedure that actually performs that transition.
 
 **`fulfill_order(p_order_id)`**  
-Transitions a `VALIDATED` order to `FULFILLED` and decrements stock.
+Transitions a `VALIDATED` order to `FULFILLED` and decrements stock. Locks the affected product rows (`SELECT ... FOR UPDATE`) and re-verifies stock under that lock immediately before decrementing.
+
+**`cancel_order(p_order_id)`**  
+Cancels an order from `PENDING` or `VALIDATED`. The only path to `CANCELLED`.
 
 ---
 
@@ -72,25 +83,27 @@ Transitions a `VALIDATED` order to `FULFILLED` and decrements stock.
 ### Packages over standalone procedures
 A package groups the spec (public contract) from the body (implementation). This allows the spec to be pinned in Oracle's shared pool, reduces parse overhead for high-frequency calls, and lets us change the body without invalidating callers — exactly how a stable API is designed.
 
-### Records and collection types in the spec
-`t_line_item` and `t_line_item_tbl` are declared in the package spec, not the body. This means callers can construct and populate the collection before they call any procedure. The alternative — constructing a collection inside the package — would require a dedicated "builder" API and limit the caller's ability to compose orders from dynamic sources.
+### SQL-level types, not package-nested ones
+`t_line_item_obj` and `t_line_item_tbl` are created at the schema level (`01_schema.sql`), not declared inside the package spec. A PL/SQL-only record/collection type cannot be unnested with `TABLE()` in a SQL statement — only a SQL object type can. Declaring them at the schema level is what makes the set-based query in `validate_stock` possible at all.
 
 ### FORALL for bulk insert/update
 `create_order` uses `FORALL` to insert all line items in a single SQL round-trip. A `FOR` loop with individual `INSERT` statements would generate one context switch per line between the PL/SQL and SQL engines. For a typical 10-line order that is negligible; for a wholesale upload of hundreds of lines it becomes the dominant cost. `FORALL` is the idiomatic Oracle pattern here.
 
 `fulfill_order` uses `BULK COLLECT` + `FORALL` for the same reason: collect all (product_id, quantity) pairs in one `SELECT`, then decrement stock in one batched `UPDATE`.
 
-### Explicit cursor in `validate_stock`
-`validate_stock` uses a parameterised explicit cursor (one `OPEN`/`FETCH`/`CLOSE` per line) rather than N individual `SELECT INTO` calls because:
+### Set-based validation instead of a cursor per line
+`validate_stock` joins the caller's line-item collection against `PRODUCTS` in a single `SELECT ... BULK COLLECT` via `TABLE(p_lines)` — one round trip regardless of how many lines are submitted. An earlier version opened a parameterised cursor once per line item; that scaled linearly with order size for no real benefit once the collection lived at the SQL level.
 
-1. The cursor declaration makes the intent explicit and self-documenting — a reader can see the full query in one place.
-2. `%ROWTYPE` binding means column additions to the query are automatically reflected in the loop variable without rename churn.
-3. It separates the query definition from the loop logic, which matters when the query is non-trivial.
+### Locking before decrementing stock
+`fulfill_order` locks the exact set of affected product rows with `SELECT ... FOR UPDATE` and re-checks stock under that lock immediately before the `FORALL` decrement. `validate_order` may have run well before `fulfill_order` is called, and a different order could have consumed the same stock in the meantime — locking closes that window instead of relying on the `stock_qty >= 0` CHECK constraint to fail the statement after the fact.
 
 ### Named exceptions over SQLCODE checks
 `WHEN pkg_order_mgmt.e_insufficient_stock THEN` is more readable, searchable, and refactoring-safe than `WHEN OTHERS THEN IF SQLCODE = -20001`. Named exceptions are part of the package contract — they appear in the spec alongside the procedures, so callers can discover them without reading the body.
 
-No `WHEN OTHERS THEN NULL` (silent swallowing). Every `WHEN OTHERS` block re-raises with `RAISE_APPLICATION_ERROR`, preserving the error context for the caller.
+No `WHEN OTHERS THEN NULL` (silent swallowing). Every `WHEN OTHERS` block re-raises with `RAISE_APPLICATION_ERROR` using `e_unexpected_error`'s own code (-20099) — never one of the four business exception codes. Reusing a business code in a catch-all handler means a caller filtering on that exception name would silently catch unrelated failures too (a constraint violation showing up disguised as "insufficient stock", for instance).
+
+### Transaction control belongs to the caller
+No procedure in this package issues `COMMIT` or `ROLLBACK`. Both affect the entire session's transaction, not just the current procedure's own changes — a reusable package has no way to know what else the caller has pending, so it must not decide when that gets committed or undone. The test script commits explicitly after each successful mutating step, the way a real caller would.
 
 ---
 

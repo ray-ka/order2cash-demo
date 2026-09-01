@@ -83,4 +83,19 @@ CREATE INDEX order2cash.idx_orders_status   ON order2cash.orders (status);
 CREATE INDEX order2cash.idx_lines_order     ON order2cash.order_lines (order_id);
 CREATE INDEX order2cash.idx_lines_product   ON order2cash.order_lines (product_id);
 
+-- ── 8. SQL-level line item types ─────────────────────────────────────────────
+-- Declared at the SQL level (not just inside the package spec) so that
+-- validate_stock can join the incoming collection against PRODUCTS in a
+-- single set-based query via TABLE(), instead of opening one cursor per
+-- line item. A PL/SQL-only record/collection type cannot be unnested with
+-- TABLE() — only a SQL object type can.
+CREATE OR REPLACE TYPE order2cash.t_line_item_obj AS OBJECT (
+    product_id  NUMBER,
+    quantity    NUMBER
+);
+/
+
+CREATE OR REPLACE TYPE order2cash.t_line_item_tbl AS TABLE OF order2cash.t_line_item_obj;
+/
+
 COMMIT;
